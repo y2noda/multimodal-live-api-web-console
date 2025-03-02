@@ -3,8 +3,8 @@ import { type FunctionDeclaration, SchemaType } from "@google/generative-ai";
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { useLiveAPIContext } from "../../contexts/LiveAPIContext";
 import { AudioRecorder } from "../../lib/audio-recorder";
-import type { ToolCall } from "../../multimodal-live-types";
-import { analyzeSceneSummary } from "../../utils/gemini-api";
+import type { LiveConfig, ToolCall } from "../../multimodal-live-types";
+import { generateSummaryAndEssay } from "../../utils/gemini-api";
 import "./scene-analyzer.scss";
 
 interface SceneInfo {
@@ -23,6 +23,8 @@ interface AnalysisStatus {
 interface ProcessingStatus {
     isVideoProcessing: boolean;
     isAnalyzing: boolean;
+    isProcessing?: boolean;
+    processingMessage?: string;
 }
 
 interface SceneAnalysisState {
@@ -30,6 +32,7 @@ interface SceneAnalysisState {
     currentIndex: number;
     processingStatus: ProcessingStatus;
     summary?: string;
+    essay?: string;
     analysisStatus: AnalysisStatus;
 }
 
@@ -48,12 +51,12 @@ const sceneAnalysisDeclaration: FunctionDeclaration = {
             },
             scene_description: {
                 type: SchemaType.STRING,
-                description: "ユーザーとの対話に基づくシーンの説明",
+                description: "ユーザーとの対話に基づくシーンの説明。人物、場所、活動内容、感情表現、天候、時間帯、色彩、音声など、できるだけ多くの情報を含めてください。また、五感（視覚、聴覚、触覚、味覚、嗅覚）を使った描写も取り入れると、より豊かな表現になります。",
             },
             should_move: {
                 type: SchemaType.BOOLEAN,
                 description:
-                    "シーンを移動するべきかどうか。trueの場合、target_scene_indexが指定されていればそのシーンへ、指定がなければ次のシーンへ移動します。ユーザーから十分に情報を得られていない場合はfalseを返してください。",
+                    "シーンを移動するべきかどうか。trueの場合のみ、次のシーンに移動します。ユーザーとの対話が十分に行われ、ユーザーが次のシーンに移動する準備ができたと判断した場合にのみtrueを返してください。それ以外の場合は必ずfalseを返してください。",
             },
             target_scene_index: {
                 type: SchemaType.NUMBER,
@@ -63,7 +66,7 @@ const sceneAnalysisDeclaration: FunctionDeclaration = {
             is_analysis_complete: {
                 type: SchemaType.BOOLEAN,
                 description:
-                    "現在のシーンの分析が完了したかどうか。trueの場合、現在のシーンの分析が完了したことを示し、自動的に次のシーンへ移動します。ユーザーから十分に情報を得られていない場合はfalseを返してください。",
+                    "現在のシーンの分析が完了したかどうか。trueの場合、現在のシーンの分析が完了したことを示しますが、自動的に次のシーンへ移動するわけではありません。シーンの移動はshould_moveパラメータによって制御されます。ユーザーから十分に情報を得られていない場合はfalseを返してください。",
             },
         },
         required: [
@@ -79,24 +82,6 @@ function SceneAnalyzerComponent() {
     const videoRef = useRef<HTMLVideoElement>(null);
     const { client, setConfig, connected } = useLiveAPIContext();
 
-    // 分析状態チェックのヘルパー関数を追加
-    const getAnalysisStatus = useCallback((state: SceneAnalysisState) => {
-        const currentScene = state.scenes[state.currentIndex];
-        const isAllAnalyzed =
-            state.analysisStatus.analyzedScenes.size ===
-            state.analysisStatus.totalScenes;
-        const isCurrentSceneAnalyzed = currentScene?.isAnalyzed ?? false;
-
-        return {
-            currentScene,
-            isAllAnalyzed,
-            isCurrentSceneAnalyzed,
-            nextUnanalyzedIndex: state.scenes.findIndex(
-                (scene) => !scene.isAnalyzed
-            ),
-        };
-    }, []);
-
     const [state, setState] = useState<SceneAnalysisState>({
         scenes: [],
         currentIndex: 0,
@@ -111,7 +96,6 @@ function SceneAnalyzerComponent() {
     });
 
     const [audioRecorder] = useState(() => new AudioRecorder());
-    const [isRecording, setIsRecording] = useState(false);
 
     // 既存のstate定義の下に追加
     const [originalVideo, setOriginalVideo] = useState<string | null>(null);
@@ -122,12 +106,18 @@ function SceneAnalyzerComponent() {
 
     // ドラッグ&ドロップの状態管理を追加
     const [isDragging, setIsDragging] = useState(false);
-
-    // 要約生成中の状態を追加
-    const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
-
-    // 新しいstate変数を追加
-    const [isSummaryDrawerOpen, setIsSummaryDrawerOpen] = useState(false);
+    
+    // 要約とエッセイを同時に生成中の状態
+    const [isGeneratingBoth, setIsGeneratingBoth] = useState(false);
+    
+    // エッセイスタイルの選択肢
+    const [essayStyle, setEssayStyle] = useState("一般的");
+    
+    // エッセイの長さの選択肢
+    const [essayLength, setEssayLength] = useState("中程度");
+    
+    // エッセイドロワーの状態
+    const [isEssayDrawerOpen, setIsEssayDrawerOpen] = useState(false);
 
     // FFmpegの初期化
     useEffect(() => {
@@ -156,7 +146,7 @@ function SceneAnalyzerComponent() {
             systemInstruction: {
                 parts: [
                     {
-                        text: "あなたは動画分析の対話アシスタントです。ユーザーと対話しながら、各シーンの内容について詳しく分析してください。ユーザーからの質問に答え、重要な要素について説明を促してください。",
+                        text: "あなたは動画分析の対話アシスタントです。ユーザーと対話しながら、各シーンの内容について詳しく分析してください。ユーザーからの質問に答え、重要な要素について説明を促してください。\n\n重要: 各シーンでは十分な対話を行ってください。ユーザーとの対話が不十分な場合は、should_moveをfalseに設定してください。is_analysis_completeはシーンの分析が完了したことを示すだけで、自動的に次のシーンに移動するわけではありません。ユーザーが次のシーンに移動する準備ができたと判断した場合のみ、should_moveをtrueに設定してください。\n\n注意: ユーザーが手動で次のシーンに移動した場合、前のシーンが分析中でなければ自動的に分析完了としてマークされます。分析中のシーンは、ユーザーが手動で移動しても自動的に分析完了としてマークされません。分析が完了していないシーンは、動画から視覚的に確認できる情報に基づいて分析が完了したとみなされます。\n\nシーン分析では、以下の要素について詳細に情報を収集してください：\n1. 人物：誰が映っているか、その表情や動作、服装など\n2. 場所：どこで撮影されているか、周囲の環境や特徴\n3. 活動内容：何をしているか、どのような行動や出来事が起きているか\n4. 感情表現：シーンから感じられる感情や雰囲気\n5. 天候・時間帯：晴れ/雨/曇り、朝/昼/夕方/夜など\n6. 色彩：主な色調や印象的な色の使い方\n7. 音声：聞こえる音や会話（ある場合）\n8. 五感的表現：視覚だけでなく、聴覚、触覚、味覚、嗅覚に関連する要素\n\nこれらの情報を総合的に収集し、scene_descriptionに詳細かつ豊かな表現で記述してください。",
                     },
                 ],
             },
@@ -229,9 +219,9 @@ function SceneAnalyzerComponent() {
                         },
                     };
 
-                    // 自動移動の条件を確認
-                    const shouldAutoMove =
-                        args.should_move || args.is_analysis_complete;
+                    // 自動移動の条件を確認 - should_moveのみを条件とし、is_analysis_completeは無視する
+                    // これにより、分析が完了しても明示的な移動指示がない限り自動的に次のシーンに移動しない
+                    const shouldAutoMove = args.should_move;
 
                     if (shouldAutoMove) {
                         const hasTargetScene =
@@ -251,6 +241,7 @@ function SceneAnalyzerComponent() {
 
                         // 次のシーンが存在し、現在のシーンと異なる場合のみ移動
                         if (nextIndex !== prev.currentIndex) {
+                            console.log(`シーン${prev.currentIndex}から${nextIndex}へ移動します（should_move=${args.should_move}）`);
                             return {
                                 ...updatedState,
                                 currentIndex: nextIndex,
@@ -262,6 +253,8 @@ function SceneAnalyzerComponent() {
                                 },
                             };
                         }
+                    } else {
+                        console.log(`シーン${prev.currentIndex}の分析状態: is_analysis_complete=${args.is_analysis_complete}, should_move=${args.should_move}`);
                     }
 
                     return updatedState;
@@ -286,171 +279,260 @@ function SceneAnalyzerComponent() {
 
     // 音声録音の処理
     useEffect(() => {
-        const onData = (base64: string) => {
-            if (isRecording) {
-                client.sendRealtimeInput([
-                    {
-                        mimeType: "audio/pcm;rate=16000",
-                        data: base64,
-                    },
-                ]);
+        let animationFrameId: number | null = null;
+        let audioBuffer: string[] = [];
+        let lastSendTime = 0;
+        const sendInterval = 200; // 送信間隔（ミリ秒）
+        let isProcessing = false; // 処理中フラグ
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+        
+        // バッファリングして送信する関数
+        const sendBufferedAudio = async () => {
+            const currentTime = performance.now();
+            
+            // 送信間隔を確認し、処理中でなく、バッファにデータがある場合のみ送信
+            if (!isProcessing && audioBuffer.length > 0 && (currentTime - lastSendTime >= sendInterval)) {
+                isProcessing = true;
+                try {
+                    // バッファに溜まったデータを一度に送信
+                    const combinedData = audioBuffer.join('');
+                    await client.sendRealtimeInput([
+                        {
+                            mimeType: "audio/pcm;rate=16000",
+                            data: combinedData,
+                        },
+                    ]);
+                    lastSendTime = currentTime;
+                    audioBuffer = [];
+                    reconnectAttempts = 0; // 送信成功したらリセット
+                } catch (error) {
+                    console.error('音声データ送信エラー:', error);
+                    // 接続が切れた場合は再接続を試みる
+                    if (reconnectAttempts < maxReconnectAttempts) {
+                        reconnectAttempts++;
+                        console.log(`再接続を試みます (${reconnectAttempts}/${maxReconnectAttempts})...`);
+                    }
+                } finally {
+                    isProcessing = false;
+                }
+            }
+            
+            // 次のフレームで再度実行（接続中の場合のみ）
+            if (connected) {
+                animationFrameId = requestAnimationFrame(sendBufferedAudio);
             }
         };
 
-        if (isRecording) {
-            audioRecorder.on("data", onData).start();
+        const onData = (base64: string) => {
+            // データをバッファに追加（バッファサイズを制限）
+            if (audioBuffer.length < 50) { // 最大バッファサイズを制限
+                audioBuffer.push(base64);
+            }
+        };
+
+        // 接続時は常に録音を開始
+        if (connected) {
+            // 既存の録音を停止してからクリーンな状態で開始
+            audioRecorder.stop();
+            audioRecorder.off("data"); // すべてのイベントリスナーを削除
+            
+            setTimeout(() => {
+                audioRecorder.on("data", onData).start().catch(err => {
+                    console.error('録音開始エラー:', err);
+                });
+                // バッファリング処理を開始
+                animationFrameId = requestAnimationFrame(sendBufferedAudio);
+            }, 100); // 少し遅延させて確実に停止処理が完了するようにする
         } else {
             audioRecorder.stop();
+            audioRecorder.off("data"); // すべてのイベントリスナーを削除
+            if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+                animationFrameId = null;
+            }
         }
+
+        // 接続状態の監視
+        const checkConnection = () => {
+            if (connected && client.ws && client.ws.readyState !== WebSocket.OPEN) {
+                console.warn('WebSocket接続が閉じられています。再接続を試みます...');
+                // 再接続処理
+                try {
+                    // 現在の設定を取得
+                    const currentConfig = client.getConfig();
+                    if (currentConfig?.model) {
+                        // 既存の接続を閉じる
+                        client.disconnect();
+                        // 少し待ってから再接続
+                        setTimeout(async () => {
+                            try {
+                                // 型アサーションを使用して型エラーを解決
+                                await client.connect(currentConfig as LiveConfig);
+                                console.log('WebSocket再接続成功');
+                                // 録音を再開
+                                audioRecorder.stop();
+                                setTimeout(() => {
+                                    audioRecorder.on("data", onData).start().catch(err => {
+                                        console.error('録音再開エラー:', err);
+                                    });
+                                }, 100);
+                            } catch (error) {
+                                console.error('WebSocket再接続失敗:', error);
+                            }
+                        }, 1000);
+                    }
+                } catch (error) {
+                    console.error('再接続処理エラー:', error);
+                }
+            }
+        };
+        
+        // 定期的に接続状態をチェック
+        const connectionCheckInterval = setInterval(checkConnection, 5000);
 
         return () => {
             audioRecorder.off("data", onData);
-        };
-    }, [isRecording, client, audioRecorder]);
-
-    // シーン検出処理
-    const detectScenes = useCallback(
-        async (videoFile: File): Promise<SceneInfo[]> => {
-            const inputFileName = "input.mp4";
-            const scenes: SceneInfo[] = [];
-
-            try {
-                console.log("シーン検出開始:", videoFile.name);
-
-                // FFmpegの初期化
-                if (!ffmpeg.loaded) {
-                    console.log("FFmpegを読み込み中...");
-                    await ffmpeg.load();
-                    console.log("FFmpeg読み込み完了");
-                }
-
-                // 動画ファイルを書き込み
-                console.log("動画ファイルを変換中...");
-                const videoData = await videoFile.arrayBuffer();
-                const videoUint8Array = new Uint8Array(videoData);
-                console.log("ファイルサイズ:", videoUint8Array.length, "bytes");
-                await ffmpeg.writeFile(inputFileName, videoUint8Array);
-                console.log("動画ファイル変換完了");
-
-                // 動画の長さを取得
-                console.log("動画の長さを取得中...");
-                let durationOutput = "";
-                ffmpeg.on("log", ({ message }) => {
-                    durationOutput += `${message}\n`;
-                    console.log("FFmpeg log:", message);
-                });
-
-                await ffmpeg.exec(["-i", inputFileName]);
-                const durationMatch = durationOutput.match(
-                    /Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})/
-                );
-                const duration = durationMatch
-                    ? Number.parseInt(durationMatch[1]) * 3600 +
-                      Number.parseInt(durationMatch[2]) * 60 +
-                      Number.parseFloat(durationMatch[3])
-                    : 0;
-                console.log("動画の長さ:", duration, "秒");
-
-                // シーン検出を実行
-                console.log("シーン検出実行中...");
-                let sceneOutput = "";
-                ffmpeg.on("log", ({ message }) => {
-                    sceneOutput = `${sceneOutput}${message}\n`;
-                    console.log("FFmpeg log:", message);
-                });
-
-                await ffmpeg.exec([
-                    "-i",
-                    inputFileName,
-                    "-vf",
-                    "select='gt(scene,0.4)',showinfo",
-                    "-f",
-                    "null",
-                    "-",
-                ]);
-
-                // タイムスタンプを抽出
-                const timestamps = extractTimestamps(sceneOutput);
-                console.log("検出されたタイムスタンプ:", timestamps);
-
-                // シーンの開始・終了時間を計算
-                const sceneTimings =
-                    timestamps.length > 0
-                        ? [0, ...timestamps, duration]
-                        : [0, duration];
-                console.log("シーンの区切り:", sceneTimings);
-
-                // 各シーンを抽出
-                for (let i = 0; i < sceneTimings.length - 1; i++) {
-                    const startTime = sceneTimings[i];
-                    const endTime = sceneTimings[i + 1];
-                    if (endTime <= startTime) continue; // 無効なシーンをスキップ
-
-                    const outputFileName = `scene_${i}.mp4`;
-                    console.log(
-                        `シーン${i + 1}を抽出中:`,
-                        startTime,
-                        "->",
-                        endTime
-                    );
-
-                    try {
-                        await ffmpeg.exec([
-                            "-i",
-                            inputFileName,
-                            "-ss",
-                            startTime.toString(),
-                            "-to",
-                            endTime.toString(),
-                            "-c",
-                            "copy",
-                            outputFileName,
-                        ]);
-
-                        const data = await ffmpeg.readFile(outputFileName);
-                        const blob = new Blob([data], { type: "video/mp4" });
-                        scenes.push({
-                            blob,
-                            startTime,
-                            endTime,
-                            isAnalyzed: false,
-                        });
-                        console.log(`シーン${i + 1}の抽出完了`);
-                    } catch (e) {
-                        console.error(`シーン${i + 1}の抽出に失敗:`, e);
-                    } finally {
-                        try {
-                            await ffmpeg.deleteFile(outputFileName);
-                        } catch {}
-                    }
-                }
-
-                return scenes;
-            } catch (error) {
-                console.error("シーン検出処理でエラーが発生しました:", error);
-                console.log("エラー詳細:", {
-                    error,
-                    stack: error instanceof Error ? error.stack : undefined,
-                    message:
-                        error instanceof Error ? error.message : String(error),
-                });
-                return [
-                    {
-                        blob: videoFile,
-                        startTime: 0,
-                        endTime: 0,
-                        isAnalyzed: false,
-                    },
-                ];
+            if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+                animationFrameId = null;
             }
-        },
-        []
-    );
+            clearInterval(connectionCheckInterval);
+        };
+    }, [connected, client, audioRecorder]);
+
+    // シーンを検出する関数
+    const detectScenes = useCallback(async (file: File): Promise<{ scenes: SceneInfo[], duration: number }> => {
+        const inputFileName = "input.mp4";
+        const scenes: SceneInfo[] = [];
+
+        try {
+            console.log("シーン検出開始:", file.name);
+
+            // FFmpegの初期化
+            if (!ffmpeg.loaded) {
+                console.log("FFmpegを読み込み中...");
+                await ffmpeg.load();
+                console.log("FFmpeg読み込み完了");
+            }
+
+            // 動画ファイルを書き込み
+            console.log("動画ファイルを変換中...");
+            const videoData = await file.arrayBuffer();
+            const videoUint8Array = new Uint8Array(videoData);
+            console.log("ファイルサイズ:", videoUint8Array.length, "bytes");
+            await ffmpeg.writeFile(inputFileName, videoUint8Array);
+            console.log("動画ファイル変換完了");
+
+            // 動画の長さを取得
+            console.log("動画の長さを取得中...");
+            let durationOutput = "";
+            ffmpeg.on("log", ({ message }) => {
+                durationOutput += `${message}\n`;
+                console.log("FFmpeg log:", message);
+            });
+
+            await ffmpeg.exec(["-i", inputFileName]);
+            const durationMatch = durationOutput.match(
+                /Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})/
+            );
+            const duration = durationMatch
+                ? Number.parseInt(durationMatch[1]) * 3600 +
+                  Number.parseInt(durationMatch[2]) * 60 +
+                  Number.parseFloat(durationMatch[3])
+                : 0;
+            console.log("動画の長さ:", duration, "秒");
+
+            // シーン検出を実行
+            console.log("シーン検出実行中...");
+            let sceneOutput = "";
+            ffmpeg.on("log", ({ message }) => {
+                sceneOutput = `${sceneOutput}${message}\n`;
+                console.log("FFmpeg log:", message);
+            });
+
+            await ffmpeg.exec([
+                "-i",
+                inputFileName,
+                "-vf",
+                "select='gt(scene,0.4)',showinfo",
+                "-f",
+                "null",
+                "-",
+            ]);
+
+            // タイムスタンプを抽出
+            const timestamps = extractTimestamps(sceneOutput);
+            console.log("検出されたタイムスタンプ:", timestamps);
+
+            // シーンの開始・終了時間を計算
+            const sceneTimings =
+                timestamps.length > 0
+                    ? [0, ...timestamps, duration]
+                    : [0, duration];
+            console.log("シーンの区切り:", sceneTimings);
+
+            // 各シーンを抽出
+            for (let i = 0; i < sceneTimings.length - 1; i++) {
+                const startTime = sceneTimings[i];
+                const endTime = sceneTimings[i + 1];
+                if (endTime <= startTime) continue; // 無効なシーンをスキップ
+
+                const outputFileName = `scene_${i}.mp4`;
+                console.log(
+                    `シーン${i + 1}を抽出中:`,
+                    startTime,
+                    "->",
+                    endTime
+                );
+
+                try {
+                    await ffmpeg.exec([
+                        "-i",
+                        inputFileName,
+                        "-ss",
+                        startTime.toString(),
+                        "-to",
+                        endTime.toString(),
+                        "-c",
+                        "copy",
+                        outputFileName,
+                    ]);
+
+                    const data = await ffmpeg.readFile(outputFileName);
+                    const blob = new Blob([data], { type: "video/mp4" });
+                    scenes.push({
+                        blob,
+                        startTime,
+                        endTime,
+                        isAnalyzed: false,
+                    });
+                    console.log(`シーン${i + 1}の抽出完了`);
+                } catch (e) {
+                    console.error(`シーン${i + 1}の抽出に失敗:`, e);
+                } finally {
+                    try {
+                        await ffmpeg.deleteFile(outputFileName);
+                    } catch {}
+                }
+            }
+
+            return { scenes, duration };
+        } catch (error) {
+            console.error("シーン検出処理でエラーが発生しました:", error);
+            console.log("エラー詳細:", {
+                error,
+                stack: error instanceof Error ? error.stack : undefined,
+                message:
+                    error instanceof Error ? error.message : String(error),
+            });
+            return { scenes: [], duration: 0 };
+        }
+    }, []);
 
     const extractTimestamps = (log: string): number[] => {
         const timestamps = new Set<number>();
         const regex = /pts_time:(\d+\.\d+)/g;
-        let match: RegExpExecArray | null;
 
         let result = regex.exec(log);
         while (result !== null) {
@@ -461,66 +543,144 @@ function SceneAnalyzerComponent() {
         return Array.from(timestamps).sort((a, b) => a - b);
     };
 
-    // ファイルアップロードのハンドラーを修正
-    const handleVideoUpload = useCallback(
+    // getBlobUrl関数を追加
+    const getBlobUrl = useCallback((scene: SceneInfo, index: number): string => {
+        try {
+            if (!blobUrls.current.has(index)) {
+                if (!scene || !scene.blob) {
+                    console.error(`シーン${index}のBlobが存在しません`);
+                    return "";
+                }
+                const blob = new Blob([scene.blob], { type: "video/mp4" });
+                const url = URL.createObjectURL(blob);
+                blobUrls.current.set(index, url);
+                console.log(`シーン${index}のBlobURL作成: ${url}`);
+            }
+            return blobUrls.current.get(index) || "";
+        } catch (error) {
+            console.error(`シーン${index}のBlobURL作成に失敗:`, error);
+            return "";
+        }
+    }, []);
+
+    // ビデオファイルを処理する関数
+    const processVideoFile = useCallback(
         async (file: File) => {
-            if (!file) return;
-
             try {
-                // 既存の状態をリセット
-                setState({
-                    scenes: [],
-                    currentIndex: 0,
+                setState((prev) => ({
+                    ...prev,
                     processingStatus: {
+                        ...prev.processingStatus,
                         isVideoProcessing: true,
-                        isAnalyzing: false,
+                        isProcessing: true,
+                        processingMessage: "ビデオを処理中...",
                     },
-                    analysisStatus: {
-                        analyzedScenes: new Set(),
-                        totalScenes: 0,
-                    },
-                });
+                }));
 
-                // 既存のBlobURLsをクリーンアップ
+                // 既存のBlobURLをクリーンアップ
                 for (const url of blobUrls.current.values()) {
                     URL.revokeObjectURL(url);
                 }
                 blobUrls.current.clear();
 
-                // 元の動画のURLを更新
-                if (originalVideo) {
-                    URL.revokeObjectURL(originalVideo);
+                // 元の動画のBlobURLを作成
+                const originalVideoUrl = URL.createObjectURL(file);
+                setOriginalVideo(originalVideoUrl);
+
+                // FFmpegを使用してシーンを検出
+                const result = await detectScenes(file);
+                const scenes = result.scenes;
+                const duration = result.duration;
+
+                if (scenes.length === 0) {
+                    throw new Error("シーンを検出できませんでした");
                 }
-                const videoUrl = URL.createObjectURL(file);
-                setOriginalVideo(videoUrl);
 
-                const scenes = await detectScenes(file);
+                // 各シーンのBlobURLを事前に作成
+                scenes.forEach((scene: SceneInfo, index: number) => {
+                    if (scene?.blob) {
+                        try {
+                            getBlobUrl(scene, index);
+                        } catch (error) {
+                            console.error(`シーン${index}のBlobURL作成に失敗:`, error);
+                        }
+                    }
+                });
 
-                setState({
+                setState((prev) => ({
+                    ...prev,
                     scenes,
                     currentIndex: 0,
+                    videoDuration: duration,
                     processingStatus: {
+                        ...prev.processingStatus,
                         isVideoProcessing: false,
-                        isAnalyzing: false,
+                        isProcessing: false,
+                        processingMessage: "",
                     },
-                    analysisStatus: {
-                        analyzedScenes: new Set(),
-                        totalScenes: scenes.length,
-                    },
-                });
+                }));
+
+                // 最初のシーンの分析を自動的に開始
+                if (scenes.length > 0 && connected) {
+                    console.log("最初のシーンの分析を自動的に開始します");
+                    client.send([
+                        {
+                            text: `このシーンについて説明してください。これは${scenes.length}シーン中の1番目のシーンです。シーンの内容を詳しく分析し、重要な要素について説明してください。ユーザーとの対話を通じて分析を深めてください。十分な対話が行われるまで次のシーンには移動しないでください。`,
+                        },
+                    ]);
+                    
+                    setState(prev => ({
+                        ...prev,
+                        processingStatus: {
+                            ...prev.processingStatus,
+                            isAnalyzing: true,
+                        },
+                    }));
+                    
+                    // 音声録音を確実に開始
+                    audioRecorder.stop();
+                    setTimeout(() => {
+                        // 音声録音の再開はuseEffectで行われるため、ここでは明示的に接続状態を更新するだけ
+                        
+                        // 接続状態を一度リセットして再接続を促す（useEffectのconnected依存配列をトリガー）
+                        client.disconnect();
+                        setTimeout(() => {
+                            const currentConfig = client.getConfig();
+                            if (currentConfig?.model) {
+                                client.connect(currentConfig as LiveConfig).then(() => {
+                                    // 再接続完了
+                                }).catch(err => {
+                                    console.error("音声録音のための再接続に失敗しました:", err);
+                                });
+                            }
+                        }, 500);
+                    }, 100);
+                }
             } catch (error) {
-                console.error("シーン分割処理でエラーが発生しました:", error);
+                console.error("ビデオ処理エラー:", error);
                 setState((prev) => ({
                     ...prev,
                     processingStatus: {
                         ...prev.processingStatus,
                         isVideoProcessing: false,
-                        isAnalyzing: false,
+                        isProcessing: false,
+                        processingMessage: `エラー: ${error instanceof Error ? error.message : "不明なエラー"}`,
                     },
                 }));
             }
         },
-        [originalVideo, detectScenes]
+        [detectScenes, getBlobUrl, client, connected, audioRecorder]
+    );
+
+    // ファイルアップロードのハンドラーを修正
+    const handleVideoUpload = useCallback(
+        async (event: React.ChangeEvent<HTMLInputElement>) => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+
+            await processVideoFile(file);
+        },
+        [processVideoFile]
     );
 
     // ドラッグ&ドロップのハンドラー
@@ -540,78 +700,98 @@ function SceneAnalyzerComponent() {
             setIsDragging(false);
             const file = e.dataTransfer.files[0];
             if (file?.type.startsWith("video/")) {
-                handleVideoUpload(file);
+                processVideoFile(file);
             }
         },
-        [handleVideoUpload]
+        [processVideoFile]
     );
 
-    // シーン変更時の処理を修正
-    const handleSceneChange = useCallback(
-        (index: number) => {
-            setState((prev) => {
-                const nextScene = prev.scenes[index];
-
-                // 分析中の場合は移動をブロック
-                if (prev.processingStatus.isAnalyzing) {
-                    return prev;
+    // シーンの静止画を取得する関数
+    const captureSceneImage = useCallback(async (scene: SceneInfo, index: number): Promise<string | undefined> => {
+        try {
+            // 一時的なビデオ要素を作成
+            const tempVideo = document.createElement('video');
+            tempVideo.muted = true;
+            tempVideo.autoplay = false;
+            
+            // シーンのBlobURLを取得
+            let blobUrl = getBlobUrl(scene, index);
+            
+            // BlobURLが無効な場合は再作成を試みる
+            if (!blobUrl) {
+                console.log(`シーン${index}のBlobURLが無効なため再作成します`);
+                // 古いURLがあれば削除
+                const oldUrl = blobUrls.current.get(index);
+                if (oldUrl) {
+                    URL.revokeObjectURL(oldUrl);
+                    blobUrls.current.delete(index);
                 }
-
-                // 新しいシーンに移動し、未分析の場合は分析を開始
-                const updatedState = {
-                    ...prev,
-                    currentIndex: index,
-                    processingStatus: {
-                        ...prev.processingStatus,
-                        isAnalyzing: !nextScene.isAnalyzed && connected,
-                    },
+                
+                // 新しいBlobを作成
+                if (scene?.blob) {
+                    const newBlob = new Blob([scene.blob], { type: "video/mp4" });
+                    blobUrl = URL.createObjectURL(newBlob);
+                    blobUrls.current.set(index, blobUrl);
+                    console.log(`シーン${index}のBlobURLを再作成しました: ${blobUrl}`);
+                } else {
+                    console.error(`シーン${index}のBlobが存在しないため画像を取得できません`);
+                    return undefined;
+                }
+            }
+            
+            tempVideo.src = blobUrl;
+            
+            // ビデオの読み込みを待つ
+            await new Promise((resolve, reject) => {
+                tempVideo.onloadeddata = resolve;
+                tempVideo.onerror = (e) => {
+                    console.error(`シーン${index}のビデオ読み込みに失敗:`, e);
+                    reject(e);
                 };
-
-                if (connected && !nextScene.isAnalyzed) {
-                    client.send([
-                        {
-                            text: `このシーンについて説明してください。これは${
-                                prev.scenes.length
-                            }シーン中の${index + 1}番目のシーンです。`,
-                        },
-                    ]);
-
-                    return {
-                        ...updatedState,
-                        ...updateAnalysisStatus(prev, index, false),
-                    };
-                }
-
-                return updatedState;
+                tempVideo.load();
             });
-        },
-        [client, connected, updateAnalysisStatus]
-    );
-
-    // コンポーネントのクリーンアップ
-    useEffect(() => {
-        return () => {
-            for (const url of blobUrls.current.values()) {
-                URL.revokeObjectURL(url);
-            }
-        };
-    }, []);
-
-    // getBlobUrl関数を追加
-    const getBlobUrl = (scene: SceneInfo, index: number): string => {
-        if (!blobUrls.current.has(index)) {
-            const blob = new Blob([scene.blob], { type: "video/mp4" });
-            blobUrls.current.set(index, URL.createObjectURL(blob));
+            
+            // シーンの中間点に移動
+            const midpointTime = (scene.endTime - scene.startTime) / 2;
+            tempVideo.currentTime = midpointTime;
+            
+            // フレームが読み込まれるのを待つ
+            await new Promise((resolve, reject) => {
+                tempVideo.onseeked = resolve;
+                tempVideo.onerror = (e) => {
+                    console.error(`シーン${index}のシーク中にエラー:`, e);
+                    reject(e);
+                };
+            });
+            
+            // キャンバスにフレームを描画
+            const canvas = document.createElement('canvas');
+            canvas.width = tempVideo.videoWidth;
+            canvas.height = tempVideo.videoHeight;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return undefined;
+            
+            ctx.drawImage(tempVideo, 0, 0, canvas.width, canvas.height);
+            
+            // Base64形式で画像データを取得
+            const base64Data = canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
+            
+            // 一時要素をクリーンアップ
+            tempVideo.remove();
+            
+            return base64Data;
+        } catch (error) {
+            console.error(`シーン${index + 1}の静止画取得に失敗:`, error);
+            return undefined;
         }
-        return blobUrls.current.get(index) || "";
-    };
+    }, [getBlobUrl]);
 
     // ファイル入力のハンドラーを追加
     const handleFileInputChange = useCallback(
         (e: React.ChangeEvent<HTMLInputElement>) => {
             const file = e.target.files?.[0];
             if (file) {
-                handleVideoUpload(file);
+                handleVideoUpload(e);
             }
             // 同じファイルを再度選択できるようにinputをリセット
             e.target.value = "";
@@ -619,117 +799,340 @@ function SceneAnalyzerComponent() {
         [handleVideoUpload]
     );
 
-    // ボタンの表示状態を管理する関数を追加
-    const getSummaryButtonState = () => {
-        if (isGeneratingSummary) {
-            return {
-                icon: <div className="loading-spinner" />,
-                text: "要約生成中",
-                disabled: true,
-            };
-        }
 
-        if (!state.scenes.every((scene) => scene.isAnalyzed)) {
-            return {
-                icon: (
-                    <span className="material-symbols-outlined">
-                        hourglass_empty
-                    </span>
-                ),
-                text: "分析完了後に要約",
-                disabled: true,
-            };
-        }
-
-        if (state.summary) {
-            return {
-                icon: (
-                    <span className="material-symbols-outlined">
-                        visibility
-                    </span>
-                ),
-                text: "要約を表示",
-                disabled: false,
-            };
-        }
-
-        return {
-            icon: <span className="material-symbols-outlined">summarize</span>,
-            text: "要約を生成",
-            disabled: false,
-        };
-    };
-
-    // 要約の表示処理
-    const handleShowSummary = useCallback(() => {
-        setIsSummaryDrawerOpen(true);
+    // 時間をフォーマットする関数
+    const formatTime = useCallback((seconds: number): string => {
+        const minutes = Math.floor(seconds / 60);
+        const remainingSeconds = Math.floor(seconds % 60);
+        return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
     }, []);
 
-    // 要約の生成処理
-    const handleGenerateSummary = useCallback(async () => {
+    // 要約とエッセイを同時に生成する処理
+    const handleGenerateSummaryAndEssay = useCallback(async () => {
         try {
-            setIsGeneratingSummary(true);
-
-            const sceneSummaries = state.scenes
-                .map(
-                    (scene, index) =>
-                        `シーン${index + 1}（${scene.startTime}秒 - ${
-                            scene.endTime
-                        }秒）: ${scene.description || "説明なし"}`
-                )
-                .join("\n\n");
-
-            const apiKey = process.env.REACT_APP_GEMINI_API_KEY;
+            setIsGeneratingBoth(true);
+            
+            // 既存の要約とエッセイをクリア
+            setState((prev) => ({ ...prev, essay: undefined }));
+            
+            // APIキーの確認
+            const apiKey = process.env.REACT_APP_GEMINI_API_KEY || localStorage.getItem("GEMINI_API_KEY");
             if (!apiKey) {
-                throw new Error("GEMINI_API_KEY が設定されていません。");
+                console.error("Gemini APIキーが設定されていません");
+                return;
             }
-
-            const summary = await analyzeSceneSummary(apiKey, sceneSummaries);
-            setState((prev) => ({ ...prev, summary }));
-            setIsSummaryDrawerOpen(true);
-        } catch (error) {
-            console.error("シーン分析の要約に失敗しました:", error);
-        } finally {
-            setIsGeneratingSummary(false);
-        }
-    }, [state.scenes]);
-
-    // 要約の再生成処理を追加
-    const handleRegenerateSummary = useCallback(async () => {
-        try {
-            setIsGeneratingSummary(true);
-
-            // 既存の要約をクリア
-            setState((prev) => ({ ...prev, summary: undefined }));
-
+            
+            // シーンの要約を構築
             const sceneSummaries = state.scenes
-                .map(
-                    (scene, index) =>
-                        `シーン${index + 1}（${scene.startTime}秒 - ${
-                            scene.endTime
-                        }秒）: ${scene.description || "説明なし"}`
-                )
+                .filter((scene) => scene.isAnalyzed)
+                .map((scene, index) => {
+                    const timeFormatted = `${formatTime(scene.startTime)} - ${formatTime(scene.endTime)}`;
+                    return `シーン ${index + 1} (${timeFormatted}): ${scene.description || "説明なし"}`;
+                })
                 .join("\n\n");
-
-            const apiKey = process.env.REACT_APP_GEMINI_API_KEY;
-            if (!apiKey) {
-                throw new Error("GEMINI_API_KEY が設定されていません。");
-            }
-
-            const summary = await analyzeSceneSummary(apiKey, sceneSummaries);
-            setState((prev) => ({ ...prev, summary }));
+            
+            // 再生成前に各シーンのBlobURLが有効であることを確認
+            state.scenes.forEach((scene, index) => {
+                if (scene?.blob) {
+                    // BlobURLが存在しない、または無効になっている場合は再作成
+                    if (!blobUrls.current.has(index) || !blobUrls.current.get(index)) {
+                        try {
+                            // 古いURLがあれば削除
+                            const oldUrl = blobUrls.current.get(index);
+                            if (oldUrl) {
+                                URL.revokeObjectURL(oldUrl);
+                                blobUrls.current.delete(index);
+                            }
+                            // 新しいURLを作成
+                            getBlobUrl(scene, index);
+                        } catch (error) {
+                            console.error(`シーン${index}のBlobURL再作成に失敗:`, error);
+                        }
+                    }
+                }
+            });
+                
+            // シーンの画像を取得
+            const sceneImagesData = await Promise.all(
+                state.scenes
+                    .filter((scene) => scene.isAnalyzed)
+                    .map(async (scene, index) => {
+                        const imageBase64 = await captureSceneImage(scene, index);
+                        return {
+                            index,
+                            startTime: scene.startTime,
+                            endTime: scene.endTime,
+                            description: scene.description || "説明なし",
+                            imageBase64
+                        };
+                    })
+            );
+            
+            // 要約とエッセイを生成
+            const { summary, essay } = await generateSummaryAndEssay(
+                apiKey,
+                sceneSummaries,
+                essayStyle,
+                essayLength,
+                sceneImagesData
+            );
+            
+            // 状態を更新（要約とエッセイの両方を保存）
+            setState((prev) => ({ ...prev, summary, essay }));
+            
+            // エッセイドロワーを開く
+            setIsEssayDrawerOpen(true);
         } catch (error) {
-            console.error("シーン分析の要約の再生成に失敗しました:", error);
+            console.error("要約とエッセイの生成に失敗しました:", error);
         } finally {
-            setIsGeneratingSummary(false);
+            setIsGeneratingBoth(false);
         }
-    }, [state.scenes]);
+    }, [state.scenes, captureSceneImage, essayStyle, essayLength, getBlobUrl, formatTime]);
+
+    // エッセイドロワーの表示
+    const renderEssayDrawer = () => {
+        // クリップボードにコピーする関数
+        const copyEssayToClipboard = () => {
+            if (state.essay) {
+                navigator.clipboard.writeText(state.essay)
+                    .then(() => {
+                        // コピー成功時の処理
+                        const toast = document.createElement('div');
+                        toast.className = 'copy-toast';
+                        toast.textContent = 'エッセイをクリップボードにコピーしました';
+                        document.body.appendChild(toast);
+                        
+                        // 3秒後にトーストを削除
+                        setTimeout(() => {
+                            toast.classList.add('hide');
+                            setTimeout(() => {
+                                document.body.removeChild(toast);
+                            }, 300);
+                        }, 3000);
+                    })
+                    .catch(err => {
+                        console.error('クリップボードへのコピーに失敗しました:', err);
+                        alert('コピーに失敗しました。もう一度お試しください。');
+                    });
+            }
+        };
+
+        return (
+            <>
+                {isEssayDrawerOpen && (
+                    <div 
+                        className="overlay" 
+                        onClick={() => setIsEssayDrawerOpen(false)} 
+                        onKeyDown={(e) => {
+                            if (e.key === 'Escape') setIsEssayDrawerOpen(false);
+                        }}
+                        role="button"
+                        tabIndex={0}
+                        aria-label="エッセイを閉じる"
+                    />
+                )}
+                <div className={`essay-drawer ${isEssayDrawerOpen ? 'open' : ''}`}>
+                    <div className="essay-drawer-header">
+                        <h3>エッセイ</h3>
+                        <div className="drawer-actions">
+                            <div className="essay-options">
+                                <div className="option-group">
+                                    <label htmlFor="essay-style">スタイル:</label>
+                                    <select
+                                        id="essay-style"
+                                        value={essayStyle}
+                                        onChange={(e) => setEssayStyle(e.target.value)}
+                                        disabled={isGeneratingBoth}
+                                    >
+                                        <option value="一般的">一般的</option>
+                                        <option value="物語風">物語風</option>
+                                        <option value="解説風">解説風</option>
+                                        <option value="詩的">詩的</option>
+                                        <option value="学術的">学術的</option>
+                                    </select>
+                                </div>
+                                <div className="option-group">
+                                    <label htmlFor="essay-length">長さ:</label>
+                                    <select
+                                        id="essay-length"
+                                        value={essayLength}
+                                        onChange={(e) => setEssayLength(e.target.value)}
+                                        disabled={isGeneratingBoth}
+                                    >
+                                        <option value="短め">短め</option>
+                                        <option value="中程度">中程度</option>
+                                        <option value="長め">長め</option>
+                                    </select>
+                                </div>
+                            </div>
+                            {state.essay && (
+                                <button
+                                    type="button"
+                                    className="action-button copy-button"
+                                    onClick={copyEssayToClipboard}
+                                    title="クリップボードにコピー"
+                                >
+                                    <span className="material-symbols-outlined">content_copy</span>
+                                </button>
+                            )}
+                            <button
+                                type="button"
+                                className="action-button regenerate-button"
+                                onClick={handleGenerateSummaryAndEssay}
+                                disabled={isGeneratingBoth}
+                                title="エッセイを再生成"
+                            >
+                                {isGeneratingBoth ? (
+                                    <div className="loading-spinner" />
+                                ) : (
+                                    <span className="material-symbols-outlined">refresh</span>
+                                )}
+                            </button>
+                            <button
+                                type="button"
+                                className="action-button"
+                                onClick={() => setIsEssayDrawerOpen(false)}
+                                title="閉じる"
+                            >
+                                <span className="material-symbols-outlined">close</span>
+                            </button>
+                        </div>
+                    </div>
+                    <div className="essay-content">
+                        {isGeneratingBoth ? (
+                            <div className="generating-message">
+                                <div className="loading-spinner" />
+                                <p>エッセイを生成中...</p>
+                            </div>
+                        ) : state.essay ? (
+                            <>
+                                {state.essay.split('\n\n').map((paragraph, i) => (
+                                    <p key={`paragraph-${i}-${paragraph.substring(0, 10)}`}>{paragraph}</p>
+                                ))}
+                                <div className="essay-actions">
+                                    <button 
+                                        type="button"
+                                        className="copy-full-button"
+                                        onClick={copyEssayToClipboard}
+                                    >
+                                        <span className="material-symbols-outlined">content_copy</span>
+                                        エッセイ全文をコピー
+                                    </button>
+                                </div>
+                            </>
+                        ) : (
+                            <div className="no-essay">
+                                エッセイはまだ生成されていません。「エッセイを生成」ボタンをクリックしてください。
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </>
+        );
+    };
+
+    // シーン変更時の処理を修正
+    const handleSceneChange = useCallback(
+        (index: number) => {
+            setState((prev) => {
+                const nextScene = prev.scenes[index];
+                if (!nextScene) {
+                    console.error(`シーン${index}が存在しません`);
+                    return prev;
+                }
+
+                // 事前にBlobURLを作成
+                try {
+                    getBlobUrl(nextScene, index);
+                } catch (error) {
+                    console.error(`シーン${index}のBlobURL作成に失敗:`, error);
+                }
+
+                // 前のシーンを自動的に分析完了としてマーク
+                const updatedScenes = [...prev.scenes];
+                const prevIndex = prev.currentIndex;
+                // 前のシーンが未分析かつ分析中でない場合のみ自動的に分析完了としてマーク
+                if (prevIndex !== index && !updatedScenes[prevIndex].isAnalyzed && !prev.processingStatus.isAnalyzing) {
+                    console.log(`シーン${prevIndex}を自動的に分析完了としてマークします`);
+                    updatedScenes[prevIndex] = {
+                        ...updatedScenes[prevIndex],
+                        isAnalyzed: true,
+                        description: updatedScenes[prevIndex].description || `シーン${prevIndex + 1}の視覚的な内容に基づく自動分析`
+                    };
+                }
+
+                // 新しいシーンに移動し、未分析の場合は分析を開始
+                const updatedState = {
+                    ...prev,
+                    scenes: updatedScenes,
+                    currentIndex: index,
+                    processingStatus: {
+                        ...prev.processingStatus,
+                        isAnalyzing: !nextScene.isAnalyzed && connected,
+                    },
+                    analysisStatus: {
+                        ...prev.analysisStatus,
+                        analyzedScenes: new Set([...prev.analysisStatus.analyzedScenes, ...(updatedScenes[prevIndex].isAnalyzed ? [prevIndex] : [])]),
+                    }
+                };
+
+                if (connected && !nextScene.isAnalyzed) {
+                    client.send([
+                        {
+                            text: `このシーンについて説明してください。これは${
+                                prev.scenes.length
+                            }シーン中の${index + 1}番目のシーンです。シーンの内容を詳しく分析し、重要な要素について説明してください。ユーザーとの対話を通じて分析を深めてください。十分な対話が行われるまで次のシーンには移動しないでください。`,
+                        },
+                    ]);
+
+                    return {
+                        ...updatedState,
+                        ...updateAnalysisStatus(updatedState, index, false),
+                    };
+                }
+
+                return updatedState;
+            });
+        },
+        [client, connected, updateAnalysisStatus, getBlobUrl]
+    );
+
+    // コンポーネントのクリーンアップ
+    useEffect(() => {
+    
+        return () => {
+            for (const url of blobUrls.current.values()) {
+                URL.revokeObjectURL(url);
+            }
+        };
+    }, []);
+
+    // シーンが変更されたときにBlobURLを事前に作成
+    useEffect(() => {
+        if (state.scenes.length > 0 && state.currentIndex >= 0 && state.currentIndex < state.scenes.length) {
+            const currentScene = state.scenes[state.currentIndex];
+            if (currentScene?.blob) {
+                try {
+                    getBlobUrl(currentScene, state.currentIndex);
+                } catch (error) {
+                    console.error(`現在のシーン(${state.currentIndex})のBlobURL作成に失敗:`, error);
+                }
+            }
+        }
+    }, [state.scenes, state.currentIndex, getBlobUrl]);
 
     return (
         <div className="scene-analyzer">
-            <div
+            <div className="scene-analyzer-header">
+                <h2>シーン分析</h2>
+                <div className="scene-analyzer-actions">
+                    {/* ヘッダー部分のエッセイ再表示ボタンを削除 */}
+                </div>
+            </div>
+
+            <div 
                 className={`upload-area ${isDragging ? "dragging" : ""} ${
-                    state.processingStatus.isVideoProcessing ? "processing" : ""
+                    state.processingStatus.isVideoProcessing || state.processingStatus.isProcessing ? "processing" : ""
                 }`}
                 onDragOver={handleDragOver}
                 onDragLeave={handleDragLeave}
@@ -739,7 +1142,7 @@ function SceneAnalyzerComponent() {
                     type="file"
                     accept="video/*"
                     onChange={handleFileInputChange}
-                    disabled={state.processingStatus.isVideoProcessing}
+                    disabled={state.processingStatus.isVideoProcessing || state.processingStatus.isProcessing}
                     id="video-upload"
                     className="hidden-input"
                 />
@@ -748,10 +1151,10 @@ function SceneAnalyzerComponent() {
                         upload_file
                     </span>
                     <div className="upload-text">
-                        {state.processingStatus.isVideoProcessing ? (
+                        {state.processingStatus.isVideoProcessing || state.processingStatus.isProcessing ? (
                             <>
                                 <div className="loading-spinner" />
-                                <p>動画を処理中...</p>
+                                <p>{state.processingStatus.processingMessage || "動画を処理中..."}</p>
                             </>
                         ) : (
                             <>
@@ -775,90 +1178,111 @@ function SceneAnalyzerComponent() {
             </div>
 
             <div className="video-container">
-                {/* 元の動画 */}
-                {originalVideo && (
-                    <div className="original-video">
-                        <h3>元の動画</h3>
-                        <video
-                            ref={originalVideoRef}
-                            src={originalVideo}
-                            controls
-                            muted // 動画の音声をミュート
-                        >
-                            <track kind="captions" />
-                        </video>
-                    </div>
-                )}
+                {/* 元の動画と現在のシーンを横並びで表示 */}
+                <div className="videos-row">
+                    {/* 元の動画 */}
+                    {originalVideo && (
+                        <div className="original-video">
+                            <h3>元の動画</h3>
+                            <video
+                                ref={originalVideoRef}
+                                src={originalVideo}
+                                controls
+                                muted // 動画の音声をミュート
+                            >
+                                <track kind="captions" />
+                            </video>
+                        </div>
+                    )}
 
-                {/* 現在のシーン */}
-                {state.scenes.length > 0 && (
-                    <div className="scene-viewer">
-                        <h3>
-                            現在のシーン{" "}
-                            {state.scenes[state.currentIndex].isAnalyzed
-                                ? "(分析済み)"
-                                : "(未分析)"}
-                        </h3>
-                        <video
-                            ref={videoRef}
-                            src={getBlobUrl(
-                                state.scenes[state.currentIndex],
-                                state.currentIndex
+                    {/* 現在のシーン */}
+                    {state.scenes.length > 0 && (
+                        <div className="scene-viewer">
+                            <h3>
+                                現在のシーン{" "}
+                                {state.scenes[state.currentIndex].isAnalyzed
+                                    ? "(分析済み)"
+                                    : "(未分析)"}
+                            </h3>
+                            {state.scenes[state.currentIndex] && state.scenes[state.currentIndex].blob ? (
+                                <video
+                                    ref={videoRef}
+                                    src={getBlobUrl(
+                                        state.scenes[state.currentIndex],
+                                        state.currentIndex
+                                    )}
+                                    controls
+                                    autoPlay
+                                    muted
+                                    onError={(e) => {
+                                        console.error("ビデオ読み込みエラー:", e);
+                                        // エラー発生時に再度BlobURLを作成して再試行
+                                        const scene = state.scenes[state.currentIndex];
+                                        if (scene?.blob) {
+                                            try {
+                                                // 古いURLを削除
+                                                const oldUrl = blobUrls.current.get(state.currentIndex);
+                                                if (oldUrl) {
+                                                    URL.revokeObjectURL(oldUrl);
+                                                    blobUrls.current.delete(state.currentIndex);
+                                                }
+                                                // 新しいURLを作成
+                                                const newUrl = getBlobUrl(scene, state.currentIndex);
+                                                if (videoRef.current) {
+                                                    videoRef.current.src = newUrl;
+                                                    videoRef.current.load();
+                                                }
+                                            } catch (error) {
+                                                console.error("ビデオ再読み込み失敗:", error);
+                                            }
+                                        }
+                                    }}
+                                />
+                            ) : (
+                                <div className="video-error">
+                                    <p>ビデオデータを読み込めませんでした</p>
+                                </div>
                             )}
-                            controls
-                            autoPlay
-                            muted
-                            onEnded={() => {
-                                if (
-                                    state.currentIndex <
-                                        state.scenes.length - 1 &&
-                                    state.scenes[state.currentIndex].isAnalyzed
-                                ) {
-                                    handleSceneChange(state.currentIndex + 1);
-                                }
-                            }}
-                        >
-                            <track kind="captions" />
-                        </video>
 
-                        {/* シーンの説明を表示 */}
-                        {state.scenes[state.currentIndex].description && (
-                            <div className="scene-description">
-                                <h4>シーンの説明</h4>
+                            {/* シーンの説明を表示 */}
+                            {state.scenes[state.currentIndex].description && (
+                                <div className="scene-description">
+                                    <h4>シーンの説明</h4>
+                                    <p>
+                                        {
+                                            state.scenes[state.currentIndex]
+                                                .description
+                                        }
+                                    </p>
+                                </div>
+                            )}
+
+                            <div className="scene-status">
                                 <p>
-                                    {
-                                        state.scenes[state.currentIndex]
-                                            .description
-                                    }
+                                    シーン {state.currentIndex + 1} /{" "}
+                                    {state.scenes.length}
+                                </p>
+                                <p>
+                                    状態:{" "}
+                                    {state.processingStatus.isAnalyzing ? (
+                                        <>分析中 </>
+                                    ) : state.scenes[state.currentIndex]
+                                          .isAnalyzed ? (
+                                        state.scenes.every(
+                                            (scene) => scene.isAnalyzed
+                                        ) ? (
+                                            "全シーン分析完了"
+                                        ) : (
+                                            "分析完了"
+                                        )
+                                    ) : (
+                                        "未分析"
+                                    )}
                                 </p>
                             </div>
-                        )}
-
-                        <div className="scene-status">
-                            <p>
-                                シーン {state.currentIndex + 1} /{" "}
-                                {state.scenes.length}
-                            </p>
-                            <p>
-                                状態:{" "}
-                                {state.processingStatus.isAnalyzing ? (
-                                    <>分析中 </>
-                                ) : state.scenes[state.currentIndex]
-                                      .isAnalyzed ? (
-                                    state.scenes.every(
-                                        (scene) => scene.isAnalyzed
-                                    ) ? (
-                                        "全シーン分析完了"
-                                    ) : (
-                                        "分析完了"
-                                    )
-                                ) : (
-                                    "未分析"
-                                )}
-                            </p>
                         </div>
-                    </div>
-                )}
+                    )}
+                </div>
             </div>
 
             {state.scenes.length > 0 && (
@@ -919,91 +1343,55 @@ function SceneAnalyzerComponent() {
                             </span>
                         </button>
 
-                        <button
-                            type="button"
-                            className="nav-button summary-button"
-                            onClick={
-                                state.summary
-                                    ? handleShowSummary
-                                    : handleGenerateSummary
-                            }
-                            disabled={getSummaryButtonState().disabled}
-                        >
-                            {getSummaryButtonState().icon}
-                            {getSummaryButtonState().text}
-                        </button>
-                    </div>
-                </div>
-            )}
-
-            {/* サマリードロワー */}
-            <div
-                className={`summary-drawer ${
-                    isSummaryDrawerOpen ? "open" : ""
-                }`}
-            >
-                <div className="summary-drawer-header">
-                    <h3>動画全体の要約</h3>
-                    <div className="drawer-actions">
-                        {state.summary && (
+                        {/* エッセイ再表示ボタン - エッセイが生成済みの場合に表示 */}
+                        {state.essay && !isEssayDrawerOpen && (
                             <button
                                 type="button"
-                                className="action-button regenerate-button"
-                                onClick={handleRegenerateSummary}
-                                disabled={isGeneratingSummary}
+                                className="nav-button essay-show-button"
+                                onClick={() => setIsEssayDrawerOpen(true)}
                             >
-                                {isGeneratingSummary ? (
-                                    <div className="loading-spinner" />
+                                <span className="material-symbols-outlined">
+                                    visibility
+                                </span>
+                                エッセイを表示
+                            </button>
+                        )}
+
+                        {/* エッセイ生成ボタン - エッセイがまだ生成されていない場合に表示 */}
+                        {!state.essay && (
+                            <button
+                                type="button"
+                                className="nav-button combined-button"
+                                onClick={handleGenerateSummaryAndEssay}
+                                disabled={
+                                    !state.scenes.every((scene) => scene.isAnalyzed) || 
+                                    isGeneratingBoth
+                                }
+                            >
+                                {isGeneratingBoth ? (
+                                    <>
+                                        <div className="loading-spinner" />
+                                        生成中...
+                                    </>
                                 ) : (
-                                    <span className="material-symbols-outlined">
-                                        refresh
-                                    </span>
+                                    <>
+                                        <span className="material-symbols-outlined">
+                                            auto_awesome
+                                        </span>
+                                        エッセイを生成
+                                    </>
                                 )}
                             </button>
                         )}
-                        <button
-                            type="button"
-                            className="action-button close-button"
-                            onClick={() => setIsSummaryDrawerOpen(false)}
-                        >
-                            <span className="material-symbols-outlined">
-                                close
-                            </span>
-                        </button>
                     </div>
                 </div>
-                <div className="summary-content">
-                    {isGeneratingSummary ? (
-                        <div className="generating-message">
-                            <div className="loading-spinner" />
-                            <p>要約を生成中...</p>
-                        </div>
-                    ) : state.summary ? (
-                        <p>{state.summary}</p>
-                    ) : (
-                        <p className="no-summary">
-                            要約はまだ生成されていません
-                        </p>
-                    )}
-                </div>
-            </div>
-
-            {/* オーバーレイ */}
-            {isSummaryDrawerOpen && (
-                <div
-                    className="overlay"
-                    onClick={() => setIsSummaryDrawerOpen(false)}
-                    onKeyPress={(e) => {
-                        if (e.key === "Enter" || e.key === " ") {
-                            setIsSummaryDrawerOpen(false);
-                        }
-                    }}
-                    role="button"
-                    tabIndex={0}
-                />
             )}
+
+            {/* エッセイドロワー */}
+            {renderEssayDrawer()}
         </div>
     );
 }
 
 export const SceneAnalyzer = memo(SceneAnalyzerComponent);
+

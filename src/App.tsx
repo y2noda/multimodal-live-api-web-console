@@ -46,15 +46,16 @@ function App() {
                         <div className="main-app-area">
                             {/* APP goes here */}
                             {/* <Altair /> */}
-                            <SceneAnalyzer />
-                            <video
-                                className={cn("stream", {
-                                    hidden: !videoRef.current || !videoStream,
-                                })}
-                                ref={videoRef}
-                                autoPlay
-                                playsInline
-                            />
+                            {videoRef.current && videoStream ? (
+                                <video
+                                    className={cn("stream")}
+                                    ref={videoRef}
+                                    autoPlay
+                                    playsInline
+                                />
+                            ) : (
+                                <SceneAnalyzer />
+                            )}
                         </div>
 
                         <ControlTray
